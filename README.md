@@ -28,6 +28,7 @@ The application templates provided in this repo scale up to **millions of pages 
 | [`Adaptive RAG App`](templates/adaptive_rag/) | A RAG application using Adaptive RAG, a technique developed by Pathway to reduce token cost in RAG up to 4x while maintaining accuracy. |
 | [`Private RAG App with Mistral and Ollama`](templates/private_rag/) |  A fully private (local) version of the `question_answering_rag` RAG pipeline using Pathway Live Data Framework, Mistral, and Ollama. |
 | [`Slides AI Search App`](templates/slides_ai_search/)                                        | An indexing pipeline for retrieving slides. It performs multi-modal of PowerPoint and PDF and maintains live index of your slides."|
+| [`Video RAG with TwelveLabs`](templates/video_rag_twelvelabs/) | A RAG pipeline over **video**. It uses [TwelveLabs](https://twelvelabs.io) Pegasus to turn videos into rich text descriptions and Marengo multimodal embeddings to index them, so you can ask questions about your videos on a live connected data source (files, Google Drive,...). |
 
 
 ## How do these AI Pipelines work?

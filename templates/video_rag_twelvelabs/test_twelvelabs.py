@@ -1,0 +1,181 @@
+# Copyright © 2026 Pathway
+
+"""Tests for the TwelveLabs video-RAG components.
+
+The no-network tests stub the TwelveLabs SDK and run without any credentials.
+The live test is skipped unless ``TWELVELABS_API_KEY`` is set in the environment.
+
+Run with::
+
+    pytest templates/video_rag_twelvelabs/test_twelvelabs.py
+"""
+
+import os
+import sys
+import types
+
+import numpy as np
+import pytest
+
+# Importing `pathway.xpacks.llm.embedders` runs the xpacks package __init__,
+# which eagerly imports sibling submodules (parsers, document_store, ...) that
+# in turn pull in heavy, optional document-parsing dependencies (docling,
+# unstructured, ...). Those are present in the `pathwaycom/pathway` Docker image
+# used to run this template but are not needed to exercise the TwelveLabs
+# components. If they are unavailable, stub the siblings so the import chain
+# succeeds in a lightweight test environment.
+try:  # pragma: no cover - only triggers when optional deps are missing
+    import pathway.xpacks.llm.embedders  # noqa: F401
+except ImportError:
+    for _name in (
+        "parsers",
+        "document_store",
+        "question_answering",
+        "rerankers",
+        "servers",
+        "splitters",
+        "vector_store",
+        "llms",
+        "prompts",
+    ):
+        _full = f"pathway.xpacks.llm.{_name}"
+        sys.modules.setdefault(_full, types.ModuleType(_full))
+
+from pathway_twelvelabs import (  # noqa: E402
+    DEFAULT_MARENGO_MODEL,
+    DEFAULT_PEGASUS_MODEL,
+    MarengoEmbedder,
+    TwelveLabsVideoParser,
+)
+
+
+class _FakeSegment:
+    def __init__(self, vector):
+        self.float_ = vector
+
+
+class _FakeTextEmbedding:
+    def __init__(self, vector):
+        self.segments = [_FakeSegment(vector)]
+
+
+class _FakeEmbeddingResponse:
+    def __init__(self, vector):
+        self.text_embedding = _FakeTextEmbedding(vector)
+
+
+class _FakeEmbed:
+    def __init__(self, vector):
+        self._vector = vector
+        self.calls = []
+
+    def create(self, *, model_name, text):
+        self.calls.append((model_name, text))
+        return _FakeEmbeddingResponse(self._vector)
+
+
+class _FakeAsset:
+    def __init__(self, id, status):
+        self.id = id
+        self.status = status
+
+
+class _FakeAssets:
+    def __init__(self):
+        self.uploaded = None
+
+    def create(self, *, method, file, filename):
+        self.uploaded = (method, filename)
+        return _FakeAsset("asset-123", "ready")
+
+    def retrieve(self, asset_id):
+        return _FakeAsset(asset_id, "ready")
+
+
+class _FakeAnalyzeResponse:
+    def __init__(self, data):
+        self.data = data
+
+
+class _FakeClient:
+    def __init__(self, *, vector=None, analyze_text="a description"):
+        self.embed = _FakeEmbed(vector or [0.0] * 512)
+        self.assets = _FakeAssets()
+        self._analyze_text = analyze_text
+        self.analyze_calls = []
+
+    def analyze(self, **kwargs):
+        self.analyze_calls.append(kwargs)
+        return _FakeAnalyzeResponse(self._analyze_text)
+
+
+# --- No-network unit tests -------------------------------------------------
+
+
+def test_embedder_returns_vector_array():
+    embedder = MarengoEmbedder()
+    embedder._client = _FakeClient(vector=list(range(512)))
+
+    out = embedder._embed_one("a red car")
+
+    assert isinstance(out, np.ndarray)
+    assert out.shape == (512,)
+    assert out.dtype == np.float32
+    assert embedder._client.embed.calls == [(DEFAULT_MARENGO_MODEL, "a red car")]
+
+
+def test_embedder_defaults():
+    embedder = MarengoEmbedder()
+    assert embedder.model == DEFAULT_MARENGO_MODEL
+    # Marengo embeds a single text per request.
+    assert embedder.max_batch_size == 1
+
+
+def test_embedding_dimension_probe_returns_512():
+    # `BaseEmbedder.get_embedding_dimension` probes `__wrapped__` with a single
+    # string (not a list); the index factory relies on this returning the true
+    # vector size, so `__wrapped__` must handle a bare string input.
+    embedder = MarengoEmbedder()
+    embedder._client = _FakeClient(vector=[0.0] * 512)
+    assert embedder.get_embedding_dimension() == 512
+
+
+def test_video_parser_uploads_then_analyzes():
+    parser = TwelveLabsVideoParser(prompt="What happens?")
+    parser._client = _FakeClient(analyze_text="A red car drives on a highway.")
+
+    out = parser.__wrapped__(b"fake-video-bytes")
+
+    assert out == [
+        ("A red car drives on a highway.", {"twelvelabs_asset_id": "asset-123"})
+    ]
+    # Asset was uploaded via the direct method...
+    assert parser._client.assets.uploaded[0] == "direct"
+    # ...and Pegasus was called with the right model, prompt and asset.
+    (call,) = parser._client.analyze_calls
+    assert call["model_name"] == DEFAULT_PEGASUS_MODEL
+    assert call["prompt"] == "What happens?"
+    assert call["video"].asset_id == "asset-123"
+
+
+def test_video_parser_failed_asset_raises():
+    parser = TwelveLabsVideoParser()
+    client = _FakeClient()
+    client.assets.create = lambda **kw: _FakeAsset("a", "failed")
+    parser._client = client
+
+    with pytest.raises(RuntimeError):
+        parser.__wrapped__(b"bytes")
+
+
+# --- Live smoke test (requires TWELVELABS_API_KEY) -------------------------
+
+
+@pytest.mark.skipif(
+    not os.environ.get("TWELVELABS_API_KEY"),
+    reason="TWELVELABS_API_KEY not set; skipping live TwelveLabs call",
+)
+def test_marengo_live_embedding_is_512_dim():
+    embedder = MarengoEmbedder()
+    vector = embedder._embed_one("a red car driving on a highway")
+    assert vector.shape == (512,)

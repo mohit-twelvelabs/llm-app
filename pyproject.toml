@@ -57,7 +57,7 @@ profile = "black"
 
 [tool.mypy]
 python_version = "3.10"
-exclude = ["templates/adaptive_rag", "templates/private_rag", "templates/document_indexing", "templates/multimodal_rag", "templates/question_answering_rag"]
+exclude = ["templates/adaptive_rag", "templates/private_rag", "templates/document_indexing", "templates/multimodal_rag", "templates/question_answering_rag", "templates/video_rag_twelvelabs"]
 ignore_missing_imports = true
 check_untyped_defs = true
 warn_redundant_casts = true
