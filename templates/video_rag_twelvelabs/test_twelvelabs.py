@@ -83,6 +83,7 @@ class _FakeAsset:
 class _FakeAssets:
     def __init__(self):
         self.uploaded = None
+        self.deleted = []
 
     def create(self, *, method, file, filename):
         self.uploaded = (method, filename)
@@ -90,6 +91,9 @@ class _FakeAssets:
 
     def retrieve(self, asset_id):
         return _FakeAsset(asset_id, "ready")
+
+    def delete(self, asset_id):
+        self.deleted.append(asset_id)
 
 
 class _FakeAnalyzeResponse:
@@ -112,6 +116,21 @@ class _FakeClient:
 # --- No-network unit tests -------------------------------------------------
 
 
+class _FakeAsyncEmbed:
+    def __init__(self, vector):
+        self._vector = vector
+        self.calls = []
+
+    async def create(self, *, model_name, text):
+        self.calls.append((model_name, text))
+        return _FakeEmbeddingResponse(self._vector)
+
+
+class _FakeAsyncClient:
+    def __init__(self, *, vector=None):
+        self.embed = _FakeAsyncEmbed(vector or [0.0] * 512)
+
+
 def test_embedder_returns_vector_array():
     embedder = MarengoEmbedder()
     embedder._client = _FakeClient(vector=list(range(512)))
@@ -131,6 +150,26 @@ def test_embedder_defaults():
     assert embedder.max_batch_size == 1
 
 
+def test_embedder_wrapped_is_async_and_concurrent():
+    # The hot path runs on the async client and returns one array per input.
+    import asyncio
+
+    embedder = MarengoEmbedder()
+    embedder._aclient = _FakeAsyncClient(vector=list(range(512)))
+
+    out = asyncio.run(embedder.__wrapped__(["a red car", "a blue boat"]))
+
+    assert len(out) == 2
+    for arr in out:
+        assert isinstance(arr, np.ndarray)
+        assert arr.shape == (512,)
+        assert arr.dtype == np.float32
+    assert embedder._aclient.embed.calls == [
+        (DEFAULT_MARENGO_MODEL, "a red car"),
+        (DEFAULT_MARENGO_MODEL, "a blue boat"),
+    ]
+
+
 def test_embedding_dimension_probe_returns_512():
     # `BaseEmbedder.get_embedding_dimension` probes `__wrapped__` with a single
     # string (not a list); the index factory relies on this returning the true
@@ -140,22 +179,33 @@ def test_embedding_dimension_probe_returns_512():
     assert embedder.get_embedding_dimension() == 512
 
 
-def test_video_parser_uploads_then_analyzes():
+def test_video_parser_uploads_then_analyzes_and_deletes_asset():
+    # Default: delete_assets=True -> asset is removed and id omitted from metadata.
     parser = TwelveLabsVideoParser(prompt="What happens?")
     parser._client = _FakeClient(analyze_text="A red car drives on a highway.")
 
     out = parser.__wrapped__(b"fake-video-bytes")
 
-    assert out == [
-        ("A red car drives on a highway.", {"twelvelabs_asset_id": "asset-123"})
-    ]
+    assert out == [("A red car drives on a highway.", {})]
     # Asset was uploaded via the direct method...
     assert parser._client.assets.uploaded[0] == "direct"
+    # ...deleted afterwards so runs don't flood the asset list...
+    assert parser._client.assets.deleted == ["asset-123"]
     # ...and Pegasus was called with the right model, prompt and asset.
     (call,) = parser._client.analyze_calls
     assert call["model_name"] == DEFAULT_PEGASUS_MODEL
     assert call["prompt"] == "What happens?"
     assert call["video"].asset_id == "asset-123"
+
+
+def test_video_parser_keeps_asset_when_disabled():
+    parser = TwelveLabsVideoParser(delete_assets=False)
+    parser._client = _FakeClient(analyze_text="desc")
+
+    out = parser.__wrapped__(b"bytes")
+
+    assert out == [("desc", {"twelvelabs_asset_id": "asset-123"})]
+    assert parser._client.assets.deleted == []
 
 
 def test_video_parser_failed_asset_raises():
@@ -166,6 +216,24 @@ def test_video_parser_failed_asset_raises():
 
     with pytest.raises(RuntimeError):
         parser.__wrapped__(b"bytes")
+    # Failure happens during upload (before analyze); nothing was deleted.
+    assert client.assets.deleted == []
+
+
+def test_video_parser_deletes_asset_even_when_analyze_raises():
+    parser = TwelveLabsVideoParser()
+    client = _FakeClient()
+
+    def _boom(**kwargs):
+        raise RuntimeError("pegasus exploded")
+
+    client.analyze = _boom
+    parser._client = client
+
+    with pytest.raises(RuntimeError):
+        parser.__wrapped__(b"bytes")
+    # try/finally still cleaned up the uploaded asset.
+    assert client.assets.deleted == ["asset-123"]
 
 
 # --- Live smoke test (requires TWELVELABS_API_KEY) -------------------------

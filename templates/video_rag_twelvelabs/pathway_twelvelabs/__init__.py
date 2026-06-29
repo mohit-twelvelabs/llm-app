@@ -22,6 +22,7 @@ TwelveLabs API key. The key is read from the ``TWELVELABS_API_KEY`` environment
 variable unless it is passed explicitly to the constructor.
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -42,6 +43,16 @@ DEFAULT_PROMPT = (
 logger = logging.getLogger(__name__)
 
 
+def _resolve_api_key(api_key: str | None) -> str:
+    key = api_key or os.environ.get("TWELVELABS_API_KEY")
+    if not key:
+        raise ValueError(
+            "TwelveLabs API key is missing. Pass `api_key=...` or set the "
+            "`TWELVELABS_API_KEY` environment variable."
+        )
+    return key
+
+
 def _build_client(api_key: str | None):
     try:
         from twelvelabs import TwelveLabs
@@ -50,13 +61,18 @@ def _build_client(api_key: str | None):
             "The `twelvelabs` package is required to use the TwelveLabs components. "
             "Install it with `pip install twelvelabs>=1.2.8`."
         ) from e
-    key = api_key or os.environ.get("TWELVELABS_API_KEY")
-    if not key:
-        raise ValueError(
-            "TwelveLabs API key is missing. Pass `api_key=...` or set the "
-            "`TWELVELABS_API_KEY` environment variable."
-        )
-    return TwelveLabs(api_key=key)
+    return TwelveLabs(api_key=_resolve_api_key(api_key))
+
+
+def _build_async_client(api_key: str | None):
+    try:
+        from twelvelabs import AsyncTwelveLabs
+    except ImportError as e:
+        raise ImportError(
+            "The `twelvelabs` package is required to use the TwelveLabs components. "
+            "Install it with `pip install twelvelabs>=1.2.8`."
+        ) from e
+    return AsyncTwelveLabs(api_key=_resolve_api_key(api_key))
 
 
 class TwelveLabsVideoParser(pw.UDF):
@@ -66,6 +82,12 @@ class TwelveLabsVideoParser(pw.UDF):
     for the asset to be ready, and then asks Pegasus to produce a textual
     description of the video using ``prompt``. The returned text is suitable for
     chunking, embedding and indexing by the standard Pathway RAG components.
+
+    By default the uploaded asset is deleted once the analysis finishes (even if
+    the analysis fails), so repeated runs do not flood the TwelveLabs asset list.
+    Set ``delete_assets=False`` to keep the assets around for reuse or
+    inspection; in that case the emitted ``twelvelabs_asset_id`` metadata refers
+    to a live, retrievable asset.
 
     Args:
         prompt: Instruction sent to Pegasus describing what to extract from the
@@ -78,6 +100,12 @@ class TwelveLabsVideoParser(pw.UDF):
         asset_poll_interval: Seconds between asset-readiness checks. Defaults to 5.
         asset_timeout: Maximum number of seconds to wait for an uploaded asset to
             become ready before raising. Defaults to 600.
+        delete_assets: If ``True`` (the default), the uploaded asset is deleted
+            after the analysis completes, so repeated runs do not accumulate
+            assets in your TwelveLabs account. When ``True``, the emitted
+            ``twelvelabs_asset_id`` metadata is omitted because the asset no
+            longer exists. Set to ``False`` to keep assets (e.g. for reuse or
+            debugging), in which case the id is included in the metadata.
         cache_strategy: Pathway caching strategy. To enable caching, pass a valid
             :py:class:`~pathway.udfs.CacheStrategy`. Defaults to ``None``.
 
@@ -97,6 +125,7 @@ class TwelveLabsVideoParser(pw.UDF):
         temperature: float | None = None,
         asset_poll_interval: float = 5.0,
         asset_timeout: float = 600.0,
+        delete_assets: bool = True,
         cache_strategy: udfs.CacheStrategy | None = None,
     ):
         super().__init__(cache_strategy=cache_strategy)
@@ -106,6 +135,7 @@ class TwelveLabsVideoParser(pw.UDF):
         self.temperature = temperature
         self.asset_poll_interval = asset_poll_interval
         self.asset_timeout = asset_timeout
+        self.delete_assets = delete_assets
         self._api_key = api_key
         self._client = None
 
@@ -137,18 +167,31 @@ class TwelveLabsVideoParser(pw.UDF):
         from twelvelabs.types.video_context import VideoContext_AssetId
 
         asset_id = self._upload_asset(contents)
-        logger.info("Analyzing TwelveLabs asset %s with Pegasus...", asset_id)
-        analyze_kwargs: dict = dict(
-            model_name=self.model,
-            video=VideoContext_AssetId(asset_id=asset_id),
-            prompt=self.prompt,
-            max_tokens=self.max_tokens,
-        )
-        if self.temperature is not None:
-            analyze_kwargs["temperature"] = self.temperature
-        response = self.client.analyze(**analyze_kwargs)
-        text = response.data or ""
-        return [(text, {"twelvelabs_asset_id": asset_id})]
+        try:
+            logger.info("Analyzing TwelveLabs asset %s with Pegasus...", asset_id)
+            analyze_kwargs: dict = dict(
+                model_name=self.model,
+                video=VideoContext_AssetId(asset_id=asset_id),
+                prompt=self.prompt,
+                max_tokens=self.max_tokens,
+            )
+            if self.temperature is not None:
+                analyze_kwargs["temperature"] = self.temperature
+            response = self.client.analyze(**analyze_kwargs)
+            text = response.data or ""
+        finally:
+            if self.delete_assets:
+                # Remove the per-run asset so repeated runs do not flood the
+                # TwelveLabs asset list. Best-effort: a cleanup failure must not
+                # mask the analysis result (or an analysis error above).
+                try:
+                    self.client.assets.delete(asset_id)
+                except Exception:  # noqa: BLE001
+                    logger.warning("Failed to delete TwelveLabs asset %s.", asset_id)
+        # When the asset has been deleted the id no longer resolves, so only
+        # surface it in the metadata when the asset is kept around.
+        metadata = {} if self.delete_assets else {"twelvelabs_asset_id": asset_id}
+        return [(text, metadata)]
 
     def __call__(self, contents: pw.ColumnExpression, **kwargs) -> pw.ColumnExpression:
         """Parse the video document.
@@ -157,8 +200,11 @@ class TwelveLabsVideoParser(pw.UDF):
             contents: Column with the raw bytes of each video.
 
         Returns:
-            A column with a list of ``(text, metadata)`` pairs for each video. The
-            metadata records the TwelveLabs ``asset_id`` used for the analysis.
+            A column with a list of ``(text, metadata)`` pairs for each video.
+            When ``delete_assets=False`` the metadata records the TwelveLabs
+            ``twelvelabs_asset_id`` used for the analysis; with the default
+            ``delete_assets=True`` the asset is removed afterwards and the id is
+            omitted (it would no longer resolve).
         """
         return super().__call__(contents, **kwargs)
 
@@ -207,6 +253,7 @@ class MarengoEmbedder(BaseEmbedder):
         self.model = model
         self._api_key = api_key
         self._client = None
+        self._aclient = None
 
     @property
     def client(self):
@@ -214,8 +261,19 @@ class MarengoEmbedder(BaseEmbedder):
             self._client = _build_client(self._api_key)
         return self._client
 
+    @property
+    def aclient(self):
+        if self._aclient is None:
+            self._aclient = _build_async_client(self._api_key)
+        return self._aclient
+
     def get_embedding_dimension(self, **kwargs) -> int:
         """Return the embedding dimension (512 for Marengo).
+
+        This is a one-time, setup-time probe: Pathway calls it once while
+        building the index, not on the per-document hot path. The single
+        synchronous request issued here is therefore intentional and acceptable
+        (the actual embedding hot path runs asynchronously via ``__wrapped__``).
 
         The base implementation probes ``__wrapped__`` with a single string and
         takes ``len`` of the result; since this embedder always returns a list of
@@ -225,12 +283,22 @@ class MarengoEmbedder(BaseEmbedder):
         return len(self._embed_one("."))
 
     def _embed_one(self, text: str) -> np.ndarray:
+        """Synchronous single-text embed, used only for the setup-time probe."""
         response = self.client.embed.create(model_name=self.model, text=text)
         vector = response.text_embedding.segments[0].float_
         return np.array(vector, dtype=np.float32)
 
+    async def _aembed_one(self, text: str) -> np.ndarray:
+        resp = await self.aclient.embed.create(model_name=self.model, text=text)
+        vector = resp.text_embedding.segments[0].float_
+        return np.array(vector, dtype=np.float32)
+
     async def __wrapped__(self, inputs: list[str], **kwargs) -> list[np.ndarray]:
         """Embed the given texts with Marengo.
+
+        Marengo embeds one text per request, so the requests are issued
+        concurrently on the async TwelveLabs client (``AsyncTwelveLabs``) rather
+        than serially, keeping the embedding hot path non-blocking.
 
         Args:
             inputs: the strings to embed.
@@ -238,4 +306,4 @@ class MarengoEmbedder(BaseEmbedder):
         Returns:
             A list of 512-dimensional ``numpy`` arrays, one per input string.
         """
-        return [self._embed_one(text) for text in inputs]
+        return list(await asyncio.gather(*[self._aembed_one(t) for t in inputs]))
